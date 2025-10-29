@@ -1,0 +1,246 @@
+'use server';
+
+import { ID } from "node-appwrite";
+import { createAdminClient, createSessionClient } from "../appwrite";
+import { cookies } from "next/headers";
+import { encryptId, extractCustomerIdFromUrl, parseStringify } from "../utils";
+import { CountryCode, ProcessorTokenCreateRequest, ProcessorTokenCreateRequestProcessorEnum, Products } from "plaid";
+import { plaidClient } from "@/lib/plaid";
+import { revalidatePath } from "next/cache";
+import { addFundingSource, createDwollaCustomer } from "./dwolla.actions";
+import { account } from "@/lib/appwriteClient"; // make sure this file exports `account` from appwrite client
+import type { IUser } from "@/types"; // optional - only if you have types, otherwise remove
+
+const {
+  APPWRITE_DATABASE_ID: DATABASE_ID,
+  APPWRITE_USER_COLLECTION_ID: USER_COLLECTION_ID,
+  APPWRITE_BANK_COLLECTION_ID: BANK_COLLECTION_ID,
+}=process.env
+
+export const signIn = async ({ email, password}:signInProps)=> {
+    try{
+        //Mutation
+        const { account } = await createAdminClient();
+        const response = await account.createEmailPasswordSession(email,password)
+        return parseStringify(response);
+    } catch(error){
+        console.error('Error',error);
+    }
+}
+export const signUp = async ({password, ...userData}:SignUpParams)=> {
+    const { email,firstName, lastName} =
+    userData;
+    let newUserAccount;
+    try{
+        //Mutation
+        const { account, database } = await createAdminClient();
+
+         newUserAccount = await account.create(
+            ID.unique(), 
+            email, 
+            password, 
+            `${firstName} ${lastName}`
+        );
+        if(!newUserAccount) throw new Error('Error creating user')
+        
+        const dwollaCustomerUrl = await createDwollaCustomer({
+          ...userData,
+          type: 'personal',
+        });
+        if(!dwollaCustomerUrl) throw new Error('Error creating Dwolla customer')
+
+        const dwollaCustomerId = extractCustomerIdFromUrl(dwollaCustomerUrl)
+
+        const newUser = await database.createDocument(
+          DATABASE_ID!,
+          USER_COLLECTION_ID!,
+          ID.unique(),
+          {
+            ...userData,
+            userId: newUserAccount.$id,
+            dwollaCustomerId,
+            dwollaCustomerUrl
+          }
+        )
+
+        const session = await account.createEmailPasswordSession(email, password);
+      
+        cookies().set("appwrite-session", session.secret, {
+          path: "/",
+          httpOnly: true,
+          sameSite: "strict",
+          secure: true,
+        });
+        return parseStringify(newUser);
+
+    } catch(error){
+        console.error('Error',error);
+    }
+}
+
+// ... your initilization functions
+
+export async function getLoggedInUser() {
+    try {
+    const me = await account.get();
+    return { ok: true, user: me };
+  } catch (err) {
+    return { ok: false, error: "No session" };
+  }
+  }
+  
+export const logoutAccount = async () => {
+  try {
+    await account.deleteSession("current");
+    return { ok: true };
+  } catch (err) {
+    console.error("[client.logoutAccount] error:", err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+  
+
+}
+export const createLinkToken = async(user: User) => {
+  try{
+    const tokenParams = {
+      user: {
+        client_user_id: user.$id
+      },
+      client_name: `${user.firstName} ${user.lastName}`,
+      products: ['auth'] as Products[],
+      language: 'en',
+      country_codes: ['US'] as CountryCode[],
+    }
+    const response = await plaidClient.linkTokenCreate(tokenParams);
+    return parseStringify({linkToken: response.data.link_token})
+  } catch(error){
+    console.log(error);
+  }
+}
+export  const createBankAccount = async ({
+  userId,
+  bankId,
+  accountId,
+  accessToken,
+  fundingSourceUrl,
+  sharableId,
+}: createBankAccountProps) =>{
+  try{
+    const {database} = await createAdminClient();
+    const bankAccount = await database.createDocument(
+      DATABASE_ID!,
+      BANK_COLLECTION_ID!,
+      ID.unique(),
+      {
+        userId,
+        bankId,
+        accountId,
+        accessToken,
+        fundingSourceUrl,
+        sharableId,
+      }
+    )
+    return parseStringify(bankAccount);
+  }catch(error){
+
+  }
+}
+
+
+export const exchangePublicToken = async ({ 
+  publicToken,
+  user,
+}: exchangePublicTokenProps)=>{
+  try{
+    const response = await plaidClient.itemPublicTokenExchange({
+      public_token: publicToken,
+    });
+    const accessToken = response.data.access_token;
+    const itemId = response.data.item_id;
+    const accountsResponse = await plaidClient.accountsGet({
+      access_token: accessToken,
+    });
+    const accountData = accountsResponse.data.accounts[0];
+    const request: ProcessorTokenCreateRequest = {
+      access_token: accessToken,
+      account_id: accountData.account_id,
+      processor: "dwolla" as ProcessorTokenCreateRequestProcessorEnum,
+    };
+    const processorTokenResponse = await plaidClient.processorTokenCreate(request);
+    const processorToken = processorTokenResponse.data.processor_token;
+     
+    const fundingSourceUrl = await addFundingSource({
+      dwollaCustomerId: user.dwollaCustomerId,
+      processorToken,
+      bankName: accountData.name,
+    });
+    if(!fundingSourceUrl)throw Error;
+
+    await createBankAccount({
+      userId:user.$id,
+      bankId:itemId,
+      accountId: accountData.account_id,
+      accessToken,
+      fundingSourceUrl,
+      sharableId: encryptId(accountData.account_id)
+    });
+
+    revalidatePath("/");
+    return parseStringify({
+      publicTokenExchange:"complete"
+    });
+
+
+  }catch(error){
+    console.error("An error occurred while creating exchanging token:",error);
+
+  }
+
+}
+
+xport async function signIn({ email, password }: { email: string; password: string }) {
+  try {
+    console.log("[client.signIn] creating email session for", email);
+    const session = await account.createEmailSession(email, password);
+    console.log("[client.signIn] session created:", session);
+    // fetch user details
+    const me = await account.get();
+    console.log("[client.signIn] user details:", me);
+    return { ok: true, session, me };
+  } catch (err: any) {
+    console.error("[client.signIn] error:", err);
+    // Appwrite error objects vary; expose a friendly message
+    const message = err?.message || err?.response || String(err);
+    return { ok: false, error: message };
+  }
+}
+
+export async function signUp(userData: {
+  email: string;
+  password: string;
+  firstName?: string;
+  lastName?: string;
+  [key: string]: any;
+}) {
+  try {
+    console.log("[client.signUp] creating user:", userData?.email);
+    // create user - Appwrite's client-side account.create is allowed
+    // Note: Appwrite's account.create signature: account.create(userId, email, password, name?) for admin,
+    // but the client-side call is account.create(email, password, name?) depending on SDK version.
+    // Try the common client form below:
+    const created = await account.create(userData.email, userData.password, `${userData.firstName ?? ""} ${userData.lastName ?? ""}`.trim() || undefined);
+    console.log("[client.signUp] created:", created);
+
+    // Create a session right away so the user is logged in
+    await account.createEmailSession(userData.email, userData.password);
+    const me = await account.get();
+    console.log("[client.signUp] logged in user:", me);
+
+    // Return the created user object (me is more reliable)
+    return { ok: true, user: me };
+  } catch (err: any) {
+    console.error("[client.signUp] error:", err);
+    const message = err?.message || String(err);
+    return { ok: false, error: message };
+  }
+}

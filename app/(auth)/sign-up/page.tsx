@@ -1,12 +1,9 @@
-import React from 'react'
-import AuthForm from '@/components/AuthForm'
+// app/(auth)/sign-up/page.tsx
+"use client";
 
-const SignIn= () => {
-  return (
-    <section className="flex-center size-full max-sm:px-6">
-      <AuthForm  type="sign-in"/>
-    </section>
-  )
+import React from "react";
+import AuthForm from "@/components/AuthForm";
+
+export default function SignUpPage() {
+  return <AuthForm type="sign-up" />;
 }
-
-export default SignIn
